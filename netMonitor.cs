@@ -198,6 +198,7 @@ namespace netMonitor
             long ifRx = -1, ifTx = -1;  // active network's interface (for quota)
             string key = null;
             string ifName = null;
+            string ifaceKind = null;
             try
             {
                 // selection order: default route (best) -> sticky interface -> first with gateway
@@ -268,6 +269,9 @@ namespace netMonitor
                     _ifaceId = chosen.Id;
                     key = chosenGw;
                     ifName = chosen.Name;
+                    ifaceKind = chosen.NetworkInterfaceType == NetworkInterfaceType.Wireless80211
+                        ? "Wi-Fi"
+                        : "Ethernet";
 
                     // WiFi: use the actual SSID as the network identity so each
                     // hotspot/router shows up separately in today's history.
@@ -322,7 +326,7 @@ namespace netMonitor
                     dRx = Math.Max(0, ifRx - _lastIfRx);
                     dTx = Math.Max(0, ifTx - _lastIfTx);
                 }
-                _quota.Touch(key, ifName, dRx, dTx, sec);
+                _quota.Touch(key, ifName, ifaceKind, dRx, dTx, sec);
                 _quota.SetActive(key);
             }
             else
@@ -760,9 +764,21 @@ namespace netMonitor
                         {
                             string name = row.Name;
                             if (name.Length > 22) name = name.Substring(0, 21) + "\u2026";
-                            string label = row.Key != null && row.Key.StartsWith("wifi:", StringComparison.Ordinal)
-                                ? name                                        // WiFi: SSID only
-                                : name + " \u00B7 " + row.Key;                // wired: adapter + gateway
+                            string iface = row.Interface ?? "";
+                            string label;
+                            if (iface == "Wi-Fi")
+                            {
+                                label = name + " \u00B7 Wi-Fi";           // SSID · Wi-Fi
+                            }
+                            else if (name.Equals("Ethernet", StringComparison.OrdinalIgnoreCase) ||
+                                     name.StartsWith("Ethernet ", StringComparison.OrdinalIgnoreCase))
+                            {
+                                label = name + " \u00B7 " + row.Key;      // adapter is named Ethernet
+                            }
+                            else
+                            {
+                                label = name + " \u00B7 Ethernet \u00B7 " + row.Key;
+                            }
                             g.DrawString(label, _font, nameBr, 23, ry);
 
                             string size = QuotaTracker.FormatBytes(row.Rx + row.Tx);
@@ -1011,6 +1027,7 @@ namespace netMonitor
         public DateTime LastSeen;
         public double ActiveSeconds;
         public bool Active;
+        public string Interface;
     }
 
     /// <summary>Snapshot of today's network history for the overlay.</summary>
@@ -1030,6 +1047,7 @@ namespace netMonitor
         private sealed class NetworkUsage
         {
             public string Name;
+            public string Interface;
             public long Rx;
             public long Tx;
             public DateTime FirstSeen;
@@ -1050,7 +1068,7 @@ namespace netMonitor
 
         /// <summary>Records usage/duration for the active network; also creates the entry
         /// as soon as a network is used, even with zero traffic.</summary>
-        public void Touch(string key, string name, long rx, long tx, double activeSeconds)
+        public void Touch(string key, string name, string iface, long rx, long tx, double activeSeconds)
         {
             CheckDay();
             bool isNew = !_today.ContainsKey(key);
@@ -1066,6 +1084,7 @@ namespace netMonitor
                 u = _today[key];
             }
             if (u.Name == null || u.Name.Length == 0) u.Name = name;
+            if (iface != null && iface.Length > 0) u.Interface = iface;
             if (rx > 0 || tx > 0)
             {
                 u.Rx += rx;
@@ -1106,6 +1125,7 @@ namespace netMonitor
             else
             {
                 src.Name = newName;
+                src.Interface = "Wi-Fi";
                 _today[newKey] = src;
             }
             _today.Remove(oldKey);
@@ -1145,10 +1165,14 @@ namespace netMonitor
                 row.LastSeen = u.LastSeen;
                 row.ActiveSeconds = u.ActiveSeconds;
                 row.Active = u.Active;
+                row.Interface = u.Interface != null && u.Interface.Length > 0
+                    ? u.Interface
+                    : (kv.Key.StartsWith("wifi:", StringComparison.Ordinal) ? "Wi-Fi" : "Ethernet");
                 view.Rows.Add(row);
                 total += u.Rx + u.Tx;
             }
-            view.Rows.Sort(delegate(QuotaRow a, QuotaRow b) { return a.FirstSeen.CompareTo(b.FirstSeen); });
+            // newest first
+            view.Rows.Sort(delegate(QuotaRow a, QuotaRow b) { return b.LastSeen.CompareTo(a.LastSeen); });
             view.TotalText = FormatBytes(total);
             return view;
         }
@@ -1179,6 +1203,7 @@ namespace netMonitor
                       .Append('|').Append(u.FirstSeen.Ticks)
                       .Append('|').Append(u.LastSeen.Ticks)
                       .Append('|').Append((long)u.ActiveSeconds)
+                      .Append('|').Append((u.Interface ?? "").Replace('|', ' '))
                       .Append(Environment.NewLine);
                 }
                 File.WriteAllText(FilePath, sb.ToString());
@@ -1208,6 +1233,7 @@ namespace netMonitor
                     if (long.TryParse(p[6], out t)) u.LastSeen = new DateTime(t);
                     long a;
                     if (long.TryParse(p[7], out a)) u.ActiveSeconds = a;
+                    if (p.Length >= 9) u.Interface = p[8];
                     if (u.FirstSeen == DateTime.MinValue) u.FirstSeen = DateTime.Now;
                     if (u.LastSeen == DateTime.MinValue) u.LastSeen = u.FirstSeen;
                     _today[p[1]] = u;

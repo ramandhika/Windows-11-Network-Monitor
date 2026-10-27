@@ -11,7 +11,8 @@ Monitor jaringan super ringan buat Windows 11: indikator koneksi di taskbar + ov
 - 🖱️ **Klik overlay** → panel detail dengan IP + riwayat jaringan hari ini; **mouse keluar** → panel menutup otomatis
 - 🌐 **Info IP**: IP lokal (WiFi/LAN) + IP publik (via ipify)
 - 🕘 **Riwayat jaringan hari ini** — jaringan apa saja yang dipakai hari ini, lengkap dengan:
-  - **nama WiFi asli (SSID)**, bukan sekadar "Wi-Fi" — tiap hotspot/router tercatat terpisah
+  - **urutan terbaru → terlama** (jaringan yang dipakai paling akhir di paling atas)
+  - **nama WiFi asli (SSID)** + label tipe `· Wi-Fi`, bukan sekadar "Wi-Fi" — tiap hotspot/router tercatat terpisah
   - interface **Ethernet/LAN** ikut tercatat, termasuk saat LAN & WiFi nyala bersamaan (mengikuti default route Windows)
   - jam mulai – jam selesai
   - durasi pemakaian
