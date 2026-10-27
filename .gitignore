@@ -1,0 +1,6 @@
+# User runtime data
+usage.cfg
+overlay.cfg
+
+# Build artifacts (exe is committed intentionally for direct download)
+*.pdb
