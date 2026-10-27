@@ -63,6 +63,8 @@ namespace netMonitor
         private string _activeKey;
         private string _ifaceId;
         private long _lastIfRx = -1;
+        private string _cachedSsid;
+        private DateTime _ssidChecked = DateTime.MinValue;
         private long _lastIfTx = -1;
         private DateTime _lastQuotaSave = DateTime.Now;
 
@@ -198,9 +200,12 @@ namespace netMonitor
             string ifName = null;
             try
             {
-                // sticky selection: keep using the same interface unless it goes away
+                // selection order: default route (best) -> sticky interface -> first with gateway
+                int bestIndex = Routing.BestInterfaceIndex();
                 NetworkInterface chosen = null;
                 string chosenGw = null;
+                NetworkInterface sticky = null;
+                string stickyGw = null;
                 NetworkInterface fallback = null;
                 string fallbackGw = null;
 
@@ -213,11 +218,24 @@ namespace netMonitor
                     catch { props = null; }
                     if (props == null || props.GatewayAddresses.Count == 0) continue;
                     string gw = props.GatewayAddresses[0].Address.ToString();
-                    if (_ifaceId != null && ni.Id == _ifaceId)
+
+                    if (bestIndex > 0)
                     {
-                        chosen = ni;
-                        chosenGw = gw;
-                        break;
+                        try
+                        {
+                            if (props.GetIPv4Properties().Index == bestIndex)
+                            {
+                                chosen = ni;
+                                chosenGw = gw;
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                    if (sticky == null && _ifaceId != null && ni.Id == _ifaceId)
+                    {
+                        sticky = ni;
+                        stickyGw = gw;
                     }
                     if (fallback == null)
                     {
@@ -227,8 +245,8 @@ namespace netMonitor
                 }
                 if (chosen == null)
                 {
-                    chosen = fallback;
-                    chosenGw = fallbackGw;
+                    chosen = sticky != null ? sticky : fallback;
+                    chosenGw = sticky != null ? stickyGw : fallbackGw;
                 }
 
                 foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -240,15 +258,35 @@ namespace netMonitor
                     tx += st.BytesSent;
                     if (chosen != null && ni.Id == chosen.Id)
                     {
-                        key = chosenGw;
-                        ifName = chosen.Name;
                         ifRx = st.BytesReceived;
                         ifTx = st.BytesSent;
                     }
                 }
 
-                if (chosen != null) _ifaceId = chosen.Id;
-                else _ifaceId = null;
+                if (chosen != null)
+                {
+                    _ifaceId = chosen.Id;
+                    key = chosenGw;
+                    ifName = chosen.Name;
+
+                    // WiFi: use the actual SSID as the network identity so each
+                    // hotspot/router shows up separately in today's history.
+                    if (chosen.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+                    {
+                        string ssid = GetSsidCached();
+                        if (ssid != null && ssid.Length > 0)
+                        {
+                            string wifiKey = "wifi:" + ssid;
+                            _quota.AdoptKey(chosenGw, wifiKey, ssid);
+                            key = wifiKey;
+                            ifName = ssid;
+                        }
+                    }
+                }
+                else
+                {
+                    _ifaceId = null;
+                }
             }
             catch { }
 
@@ -303,6 +341,15 @@ namespace netMonitor
 
             _tray.Text = Clamp("netMonitor - " + FormatSpeed(down) + " | " + FormatSpeed(up), 63);
             _overlay.UpdateStatus(_isOnline, down, up);
+        }
+
+        private string GetSsidCached()
+        {
+            // refresh every 2s; cheap native call, no process spawn
+            if ((DateTime.Now - _ssidChecked).TotalSeconds < 2) return _cachedSsid;
+            _ssidChecked = DateTime.Now;
+            _cachedSsid = WifiSsid.GetCurrent();
+            return _cachedSsid;
         }
 
         private QuotaView GetQuotaView()
@@ -712,8 +759,10 @@ namespace netMonitor
                         using (SolidBrush sizeBr = new SolidBrush(Color.FromArgb(210, 220, 220, 220)))
                         {
                             string name = row.Name;
-                            if (name.Length > 18) name = name.Substring(0, 17) + "\u2026";
-                            string label = name + " \u00B7 " + row.Key;
+                            if (name.Length > 22) name = name.Substring(0, 21) + "\u2026";
+                            string label = row.Key != null && row.Key.StartsWith("wifi:", StringComparison.Ordinal)
+                                ? name                                        // WiFi: SSID only
+                                : name + " \u00B7 " + row.Key;                // wired: adapter + gateway
                             g.DrawString(label, _font, nameBr, 23, ry);
 
                             string size = QuotaTracker.FormatBytes(row.Rx + row.Tx);
@@ -803,6 +852,154 @@ namespace netMonitor
         }
     }
 
+    /// <summary>Asks Windows which interface actually carries outgoing traffic (default route).</summary>
+    internal static class Routing
+    {
+        [System.Runtime.InteropServices.DllImport("iphlpapi.dll")]
+        private static extern int GetBestInterface(uint destAddr, out uint bestIndex);
+
+        public static int BestInterfaceIndex()
+        {
+            try
+            {
+                uint index;
+                // 1.1.1.1 (0x01010101) as the probe destination
+                if (GetBestInterface(0x01010101, out index) == 0) return (int)index;
+            }
+            catch { }
+            return -1;
+        }
+    }
+
+    /// <summary>Reads the current WiFi SSID via the native WLAN API (wlanapi.dll).</summary>
+    internal static class WifiSsid
+    {
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern int WlanOpenHandle(uint clientVersion, IntPtr reserved,
+            out uint negotiatedVersion, out IntPtr clientHandle);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern int WlanCloseHandle(IntPtr clientHandle, IntPtr reserved);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern int WlanEnumInterfaces(IntPtr clientHandle, IntPtr reserved,
+            out IntPtr interfaceList);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern int WlanQueryInterface(IntPtr clientHandle, ref Guid interfaceGuid,
+            int opCode, IntPtr reserved, out int dataSize, out IntPtr data,
+            IntPtr opcodeValueType);
+
+        [System.Runtime.InteropServices.DllImport("wlanapi.dll")]
+        private static extern void WlanFreeMemory(IntPtr memory);
+
+        [System.Runtime.InteropServices.StructLayout(
+            System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private struct WlanInterfaceInfo
+        {
+            public Guid InterfaceGuid;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string Description;
+            public int State; // 1 = connected
+        }
+
+        [System.Runtime.InteropServices.StructLayout(
+            System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private struct WlanConnectionAttributes
+        {
+            public int State;
+            public int ConnectionMode;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string ProfileName;
+            public WlanAssociationAttributes Association;
+            public WlanSecurityAttributes Security;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct WlanAssociationAttributes
+        {
+            public Dot11Ssid Ssid;
+            public int BssType;
+            public int PhyType;
+            public uint PhyIndex;
+            public uint SignalQuality;
+            public uint RxRate;
+            public uint TxRate;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct Dot11Ssid
+        {
+            public uint Length;
+            [System.Runtime.InteropServices.MarshalAs(
+                System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)]
+            public byte[] Bytes;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct WlanSecurityAttributes
+        {
+            public int SecurityEnabled;
+            public int OneXEnabled;
+            public int AuthAlgorithm;
+            public int CipherAlgorithm;
+        }
+
+        private const int OpcodeCurrentConnection = 7;
+
+        /// <summary>SSID currently connected to, or null when not on WiFi / API unavailable.</summary>
+        public static string GetCurrent()
+        {
+            IntPtr handle = IntPtr.Zero;
+            IntPtr list = IntPtr.Zero;
+            try
+            {
+                uint negotiated;
+                if (WlanOpenHandle(2, IntPtr.Zero, out negotiated, out handle) != 0) return null;
+                if (WlanEnumInterfaces(handle, IntPtr.Zero, out list) != 0 || list == IntPtr.Zero) return null;
+
+                int count = System.Runtime.InteropServices.Marshal.ReadInt32(list);
+                int size = System.Runtime.InteropServices.Marshal.SizeOf(typeof(WlanInterfaceInfo));
+                for (int i = 0; i < count; i++)
+                {
+                    IntPtr item = (IntPtr)(list.ToInt64() + 8 + i * size);
+                    WlanInterfaceInfo info = (WlanInterfaceInfo)System.Runtime.InteropServices.Marshal
+                        .PtrToStructure(item, typeof(WlanInterfaceInfo));
+                    if (info.State != 1) continue; // not connected
+
+                    IntPtr data = IntPtr.Zero;
+                    int dataSize;
+                    int rc = WlanQueryInterface(handle, ref info.InterfaceGuid, OpcodeCurrentConnection,
+                        IntPtr.Zero, out dataSize, out data, IntPtr.Zero);
+                    if (rc != 0 || data == IntPtr.Zero) continue;
+                    try
+                    {
+                        WlanConnectionAttributes attrs = (WlanConnectionAttributes)
+                            System.Runtime.InteropServices.Marshal.PtrToStructure(
+                                data, typeof(WlanConnectionAttributes));
+                        int len = (int)attrs.Association.Ssid.Length;
+                        byte[] bytes = attrs.Association.Ssid.Bytes;
+                        if (bytes == null || len <= 0 || len > 32) continue;
+                        return Encoding.UTF8.GetString(bytes, 0, len);
+                    }
+                    finally
+                    {
+                        WlanFreeMemory(data);
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                if (list != IntPtr.Zero) WlanFreeMemory(list);
+                if (handle != IntPtr.Zero) WlanCloseHandle(handle, IntPtr.Zero);
+            }
+            return null;
+        }
+    }
+
     /// <summary>One network used today, shown in the detail panel.</summary>
     internal sealed class QuotaRow
     {
@@ -881,6 +1078,37 @@ namespace netMonitor
             {
                 u.ActiveSeconds += activeSeconds;
             }
+            _dirty = true;
+        }
+
+        /// <summary>Migrates a legacy gateway-keyed WiFi entry to its SSID key, so today's
+        /// usage survives the upgrade. Ethernet entries (named after the adapter) are left alone.</summary>
+        public void AdoptKey(string oldKey, string newKey, string newName)
+        {
+            if (oldKey == null || newKey == null || oldKey == newKey) return;
+            CheckDay();
+            NetworkUsage src;
+            if (!_today.TryGetValue(oldKey, out src)) return;
+            bool legacyWifi = src.Name == null || src.Name.Length == 0 ||
+                              src.Name.Equals("Wi-Fi", StringComparison.OrdinalIgnoreCase) ||
+                              src.Name.StartsWith("Jaringan ", StringComparison.OrdinalIgnoreCase);
+            if (!legacyWifi) return;
+
+            NetworkUsage dst;
+            if (_today.TryGetValue(newKey, out dst))
+            {
+                dst.Rx += src.Rx;
+                dst.Tx += src.Tx;
+                dst.ActiveSeconds += src.ActiveSeconds;
+                if (src.FirstSeen < dst.FirstSeen) dst.FirstSeen = src.FirstSeen;
+                if (src.LastSeen > dst.LastSeen) dst.LastSeen = src.LastSeen;
+            }
+            else
+            {
+                src.Name = newName;
+                _today[newKey] = src;
+            }
+            _today.Remove(oldKey);
             _dirty = true;
         }
 

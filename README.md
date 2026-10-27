@@ -11,7 +11,8 @@ Monitor jaringan super ringan buat Windows 11: indikator koneksi di taskbar + ov
 - 🖱️ **Klik overlay** → panel detail dengan IP + riwayat jaringan hari ini; **mouse keluar** → panel menutup otomatis
 - 🌐 **Info IP**: IP lokal (WiFi/LAN) + IP publik (via ipify)
 - 🕘 **Riwayat jaringan hari ini** — jaringan apa saja yang dipakai hari ini, lengkap dengan:
-  - nama interface (Wi-Fi / Ethernet) + IP gateway
+  - **nama WiFi asli (SSID)**, bukan sekadar "Wi-Fi" — tiap hotspot/router tercatat terpisah
+  - interface **Ethernet/LAN** ikut tercatat, termasuk saat LAN & WiFi nyala bersamaan (mengikuti default route Windows)
   - jam mulai – jam selesai
   - durasi pemakaian
   - total serta rincian ↓ download / ↑ upload per jaringan
@@ -65,7 +66,8 @@ atau buka `netMonitor.cs` di Visual Studio / Rider / dotnet-script.
 
 ## ❓ Catatan
 
-- Kuota & riwayat diidentifikasi dari **IP gateway**. Dua SSID berbeda yang gateway-nya sama persis (misal 2.4GHz/5GHz router yang sama) dihitung sebagai satu jaringan.
+- Kuota & riwayat diidentifikasi dari **SSID WiFi** (via Windows WLAN API) atau **IP gateway** untuk Ethernet. Dua SSID berbeda dihitung sebagai dua jaringan terpisah, walaupun routernya sama.
+- Riwayat bersifat **real-time** — aplikasi tidak bisa mencatat pemakaian sebelum dia jalan (tidak ada data historis dari Windows).
 - Data tersimpan lokal di `usage.cfg` (kuota + riwayat) dan `overlay.cfg` (posisi overlay), tidak ikut ter-commit ke repo.
 - Overlay selalu di atas (topmost) — klik kanan ikon tray → "Tampilkan / Sembunyikan overlay" kalau mau disembunyikan sementara.
 - Test cepat: jalankan `netMonitor.exe --expand` untuk langsung membuka panel detail saat start.
