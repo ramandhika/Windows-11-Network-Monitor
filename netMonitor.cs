@@ -30,6 +30,11 @@ namespace netMonitor
             using (Mutex mutex = new Mutex(true, "Local\\netMonitor.SingleInstance", out createdNew))
             {
                 if (!createdNew) return; // already running, just exit
+                try
+                {
+                    ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+                }
+                catch { }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 Application.Run(new NetMonitorContext());
@@ -56,6 +61,7 @@ namespace netMonitor
         // quota tracking (per network + per day)
         private readonly QuotaTracker _quota = new QuotaTracker();
         private string _activeKey;
+        private string _ifaceId;
         private long _lastIfRx = -1;
         private long _lastIfTx = -1;
         private DateTime _lastQuotaSave = DateTime.Now;
@@ -63,7 +69,7 @@ namespace netMonitor
         public NetMonitorContext()
         {
             _quota.Load();
-            _overlay = new OverlayForm(GetQuotaLine);
+            _overlay = new OverlayForm(GetQuotaView);
 
             _tray = new NotifyIcon
             {
@@ -189,8 +195,42 @@ namespace netMonitor
             long rx = 0, tx = 0;        // all up interfaces (for the speed display)
             long ifRx = -1, ifTx = -1;  // active network's interface (for quota)
             string key = null;
+            string ifName = null;
             try
             {
+                // sticky selection: keep using the same interface unless it goes away
+                NetworkInterface chosen = null;
+                string chosenGw = null;
+                NetworkInterface fallback = null;
+                string fallbackGw = null;
+
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    IPInterfaceProperties props;
+                    try { props = ni.GetIPProperties(); }
+                    catch { props = null; }
+                    if (props == null || props.GatewayAddresses.Count == 0) continue;
+                    string gw = props.GatewayAddresses[0].Address.ToString();
+                    if (_ifaceId != null && ni.Id == _ifaceId)
+                    {
+                        chosen = ni;
+                        chosenGw = gw;
+                        break;
+                    }
+                    if (fallback == null)
+                    {
+                        fallback = ni;
+                        fallbackGw = gw;
+                    }
+                }
+                if (chosen == null)
+                {
+                    chosen = fallback;
+                    chosenGw = fallbackGw;
+                }
+
                 foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
@@ -198,16 +238,17 @@ namespace netMonitor
                     IPv4InterfaceStatistics st = ni.GetIPv4Statistics();
                     rx += st.BytesReceived;
                     tx += st.BytesSent;
-                    if (key != null) continue;
-                    // first up interface with a default gateway = the network we are on
-                    IPInterfaceProperties props;
-                    try { props = ni.GetIPProperties(); }
-                    catch { props = null; }
-                    if (props == null || props.GatewayAddresses.Count == 0) continue;
-                    key = props.GatewayAddresses[0].Address.ToString();
-                    ifRx = st.BytesReceived;
-                    ifTx = st.BytesSent;
+                    if (chosen != null && ni.Id == chosen.Id)
+                    {
+                        key = chosenGw;
+                        ifName = chosen.Name;
+                        ifRx = st.BytesReceived;
+                        ifTx = st.BytesSent;
+                    }
                 }
+
+                if (chosen != null) _ifaceId = chosen.Id;
+                else _ifaceId = null;
             }
             catch { }
 
@@ -235,9 +276,20 @@ namespace netMonitor
                 _lastIfRx = -1;
                 _lastIfTx = -1;
             }
-            if (key != null && _lastIfRx >= 0 && sec > 0.25)
+            if (key != null)
             {
-                _quota.Add(key, Math.Max(0, ifRx - _lastIfRx), Math.Max(0, ifTx - _lastIfTx));
+                long dRx = 0, dTx = 0;
+                if (_lastIfRx >= 0 && sec > 0.25)
+                {
+                    dRx = Math.Max(0, ifRx - _lastIfRx);
+                    dTx = Math.Max(0, ifTx - _lastIfTx);
+                }
+                _quota.Touch(key, ifName, dRx, dTx, sec);
+                _quota.SetActive(key);
+            }
+            else
+            {
+                _quota.SetActive(null);
             }
             _lastIfRx = ifRx;
             _lastIfTx = ifTx;
@@ -253,11 +305,9 @@ namespace netMonitor
             _overlay.UpdateStatus(_isOnline, down, up);
         }
 
-        private string GetQuotaLine()
+        private QuotaView GetQuotaView()
         {
-            return _activeKey == null
-                ? "Kuota: -"
-                : "Kuota: " + _quota.Total(_activeKey);
+            return _quota.TodayHistory();
         }
 
         private static string FormatSpeed(double bytesPerSec)
@@ -318,29 +368,50 @@ namespace netMonitor
         private readonly Font _font = new Font("Segoe UI Semibold", 8.25f);
         private string _text = "...";
 
-        // expanded state (hover): shows LAN + public IP + quota under the speeds
+        // expanded state (click): shows LAN/public IP + today's network history
         private bool _expanded;
         private string _lanIp;
         private string _pubIp;
         private DateTime _pubFetched = DateTime.MinValue;
         private bool _pubFetching;
-        private readonly Func<string> _quotaGetter;
+        private readonly Func<QuotaView> _quotaView;
+        private QuotaView _view;
+        private readonly Font _fontSmall = new Font("Segoe UI", 7.25f);
+        private DateTime _expandedAt = DateTime.MinValue;
+        private readonly bool _debug = Array.IndexOf(Environment.GetCommandLineArgs(), "--debug") >= 0;
+
+        private void Log(string message)
+        {
+            if (!_debug) return;
+            try
+            {
+                File.AppendAllText(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "events.log"),
+                    DateTime.Now.ToString("HH:mm:ss.fff") + " " + message + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        public const int CompactWidth = 170;
+        public const int CompactHeight = 24;
+        public const int DetailWidth = 300;
+        public const int DetailRowHeight = 32;
 
         public bool AllowClose
         {
             set { _allowClose = value; }
         }
 
-        public OverlayForm(Func<string> quotaGetter)
+        public OverlayForm(Func<QuotaView> quotaView)
         {
-            _quotaGetter = quotaGetter;
+            _quotaView = quotaView;
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.Manual;
             TopMost = true;
             ShowInTaskbar = false;
             BackColor = Color.FromArgb(32, 32, 32);
             Opacity = 0.9;
-            Size = new Size(FixedWidth, 24);
+            Size = new Size(CompactWidth, CompactHeight);
             DoubleBuffered = true;
 
             // default: right above the tray icons (network icon area), bottom of the screen
@@ -354,33 +425,44 @@ namespace netMonitor
             MouseMove += OnMouseMove;
             MouseUp += OnMouseUp;
             Paint += OnPaint;
-            MouseClick += delegate { SetExpanded(!_expanded); }; // click to open/close
-            MouseLeave += delegate { if (!_dragging) SetExpanded(false); }; // mouse out = close
+            MouseClick += delegate { Log("MouseClick"); SetExpanded(!_expanded); }; // click to open/close
+            MouseLeave += delegate
+            {
+                Log("MouseLeave drag=" + _dragging + " sinceExpand=" + (DateTime.Now - _expandedAt).TotalMilliseconds);
+                // ignore a leave fired right after opening (resize can cause a spurious leave)
+                if (!_dragging && (DateTime.Now - _expandedAt).TotalMilliseconds > 400) SetExpanded(false);
+            };
 
             UpdateStatus(true, 0, 0);
             Show();
             FetchPublicIp(); // warm the cache so hover shows it instantly
+            if (Array.IndexOf(Environment.GetCommandLineArgs(), "--expand") >= 0) SetExpanded(true);
         }
 
-        /// <summary>Open on click (show IP + quota info), close when the mouse leaves. Bottom edge stays put.</summary>
+        /// <summary>Open on click (show IP + today's network history), close when the mouse leaves.
+        /// Anchored bottom-right so growing upward never covers the taskbar.</summary>
         private void SetExpanded(bool expand)
         {
             if (_expanded == expand) return;
+            _expandedAt = DateTime.Now;
+            Log("SetExpanded(" + expand + ") at " + Location.X + "," + Location.Y + " size " + Width + "x" + Height);
+            int bottom = Location.Y + Height;
+            int right = Location.X + Width;
             _expanded = expand;
             if (expand)
             {
                 _lanIp = GetLanIp();
+                _view = _quotaView != null ? _quotaView() : null;
                 if (_pubIp == null || (DateTime.Now - _pubFetched).TotalMinutes >= 10)
                 {
                     FetchPublicIp();
                 }
             }
-            int x = Math.Max(6, Location.X);
-            int y = expand
-                ? Math.Max(6, Location.Y - 60)   // grow upward, keep bottom edge near the tray
-                : Location.Y + 60;
-            Location = new Point(x, y);
             RecomputeSize();
+            Rectangle wa = Screen.FromPoint(Location).WorkingArea;
+            int x = Math.Max(wa.Left + 4, Math.Min(right - Width, wa.Right - Width - 4));
+            int y = Math.Max(wa.Top + 4, bottom - Height);
+            Location = new Point(x, y);
         }
 
         public void Toggle()
@@ -406,15 +488,25 @@ namespace netMonitor
             _text = _online
                 ? string.Format("\u2193 {0}   \u2191 {1}", F(_down), F(_up))
                 : "Tidak ada internet";
+            if (_expanded) _view = _quotaView != null ? _quotaView() : null;
             RecomputeSize();
+        }
+
+        private int DetailHeight()
+        {
+            int count = _view != null ? Math.Min(_view.Rows.Count, 5) : 0;
+            return 68 + Math.Max(1, count) * DetailRowHeight + 10;
         }
 
         private void RecomputeSize()
         {
-            // fixed size - only the height changes between compact and expanded
-            int h = _expanded ? 84 : 24;
-            if (Height != h)
+            // compact: fixed 170x24 | detail (click): fixed 300 wide, height follows entries
+            int w = _expanded ? DetailWidth : CompactWidth;
+            int h = _expanded ? DetailHeight() : CompactHeight;
+            bool changed = Width != w || Height != h;
+            if (changed)
             {
+                Width = w;
                 Height = h;
                 ApplyRoundedRegion();
             }
@@ -422,7 +514,6 @@ namespace netMonitor
         }
 
         private const int CornerRadius = 6;
-        private const int FixedWidth = 170;
 
         private void ApplyRoundedRegion()
         {
@@ -492,17 +583,26 @@ namespace netMonitor
             Task.Factory.StartNew(delegate
             {
                 string result = null;
-                try
+                string[] urls = new string[]
                 {
-                    HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://api.ipify.org");
-                    req.Timeout = 6000;
-                    using (WebResponse resp = req.GetResponse())
-                    using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                    "https://api.ipify.org",
+                    "http://api.ipify.org"
+                };
+                foreach (string url in urls)
+                {
+                    try
                     {
-                        result = sr.ReadToEnd().Trim();
+                        HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                        req.Timeout = 6000;
+                        using (WebResponse resp = req.GetResponse())
+                        using (StreamReader sr = new StreamReader(resp.GetResponseStream()))
+                        {
+                            result = sr.ReadToEnd().Trim();
+                        }
+                        if (result != null && result.Length > 0) break;
                     }
+                    catch { result = null; }
                 }
-                catch { }
 
                 bool ok = result != null && result.Length <= 45;
                 _pubFetched = ok ? DateTime.Now : DateTime.Now.AddMinutes(-8); // retry sooner on failure
@@ -530,6 +630,16 @@ namespace netMonitor
             return bytesPerSec.ToString("F0") + " B/s";
         }
 
+        private static string Dur(double seconds)
+        {
+            int total = (int)Math.Round(seconds);
+            int h = total / 3600;
+            int m = (total % 3600) / 60;
+            if (h > 0) return h + "j " + m + "m";
+            if (m > 0) return m + "m";
+            return "<1m";
+        }
+
         private void OnPaint(object sender, PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -549,18 +659,79 @@ namespace netMonitor
                 g.DrawString(_text, _font, br, 22, 5);
             }
 
-            // expanded rows: separator line + LAN/public IP
+            // expanded panel: separator, IP info, then today's network history
             if (_expanded)
             {
                 using (Pen sep = new Pen(Color.FromArgb(60, 255, 255, 255)))
                 {
                     g.DrawLine(sep, 10, 25, Width - 10, 25);
+                    g.DrawLine(sep, 10, 46, Width - 10, 46);
                 }
-                using (SolidBrush info = new SolidBrush(Color.FromArgb(185, 200, 200, 200)))
+
+                // one compact line for both IPs
+                using (SolidBrush info = new SolidBrush(Color.FromArgb(180, 175, 175, 175)))
                 {
-                    g.DrawString("Lokal: " + (_lanIp ?? "-"), _font, info, 12, 28);
-                    g.DrawString("Publik: " + PubText(), _font, info, 12, 46);
-                    g.DrawString(_quotaGetter != null ? _quotaGetter() : "Kuota: -", _font, info, 12, 64);
+                    string ipLine = "Lokal " + (_lanIp ?? "-") + "   \u00B7   Publik " + PubText();
+                    g.DrawString(ipLine, _fontSmall, info, 12, 29);
+                }
+
+                // section header + total today
+                using (SolidBrush title = new SolidBrush(Color.Gainsboro))
+                using (SolidBrush totalBr = new SolidBrush(Color.FromArgb(255, 190, 235, 190)))
+                {
+                    g.DrawString("Riwayat hari ini", _font, title, 12, 50);
+                    string total = _view != null ? _view.TotalText : "0 B";
+                    SizeF ts = g.MeasureString(total, _font);
+                    g.DrawString(total, _font, totalBr, Width - 12 - ts.Width, 50);
+                }
+
+                int y = 68;
+                int count = _view != null ? Math.Min(_view.Rows.Count, 5) : 0;
+                if (count == 0)
+                {
+                    using (SolidBrush empty = new SolidBrush(Color.FromArgb(150, 160, 160, 160)))
+                    {
+                        g.DrawString("Belum ada data jaringan hari ini", _fontSmall, empty, 12, y + 2);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        QuotaRow row = _view.Rows[i];
+                        int ry = y + i * DetailRowHeight;
+                        bool active = row.Active;
+
+                        // bullet: green for the network in use right now, dim otherwise
+                        using (SolidBrush bullet = new SolidBrush(active ? Color.LimeGreen : Color.FromArgb(80, 80, 80)))
+                        {
+                            g.FillEllipse(bullet, 11, ry + 5, 7, 7);
+                        }
+
+                        using (SolidBrush nameBr = new SolidBrush(active ? Color.Gainsboro : Color.FromArgb(165, 172, 172, 172)))
+                        using (SolidBrush sizeBr = new SolidBrush(Color.FromArgb(210, 220, 220, 220)))
+                        {
+                            string name = row.Name;
+                            if (name.Length > 18) name = name.Substring(0, 17) + "\u2026";
+                            string label = name + " \u00B7 " + row.Key;
+                            g.DrawString(label, _font, nameBr, 23, ry);
+
+                            string size = QuotaTracker.FormatBytes(row.Rx + row.Tx);
+                            SizeF ss = g.MeasureString(size, _font);
+                            g.DrawString(size, _font, sizeBr, Width - 12 - ss.Width, ry);
+                        }
+
+                        using (SolidBrush subBr = new SolidBrush(Color.FromArgb(145, 165, 165, 165)))
+                        {
+                            string range = row.FirstSeen.ToString("HH:mm") + "\u2013" +
+                                (active ? "sekarang" : row.LastSeen.ToString("HH:mm"));
+                            string sub = string.Format("{0}  \u00B7  {1}  \u00B7  \u2193 {2}  \u2191 {3}",
+                                range, Dur(row.ActiveSeconds),
+                                QuotaTracker.FormatBytes(row.Rx),
+                                QuotaTracker.FormatBytes(row.Tx));
+                            g.DrawString(sub, _fontSmall, subBr, 23, ry + 16);
+                        }
+                    }
                 }
             }
 
@@ -632,8 +803,28 @@ namespace netMonitor
         }
     }
 
+    /// <summary>One network used today, shown in the detail panel.</summary>
+    internal sealed class QuotaRow
+    {
+        public string Key;
+        public string Name;
+        public long Rx;
+        public long Tx;
+        public DateTime FirstSeen;
+        public DateTime LastSeen;
+        public double ActiveSeconds;
+        public bool Active;
+    }
+
+    /// <summary>Snapshot of today's network history for the overlay.</summary>
+    internal sealed class QuotaView
+    {
+        public List<QuotaRow> Rows = new List<QuotaRow>();
+        public string TotalText = "0 B";
+    }
+
     /// <summary>Cumulative per-day byte usage per network (keyed by gateway IP).
-    /// New day = clean slate. Persisted to usage.cfg so restarts don't lose today's count.</summary>
+    /// New day = clean slate. Persisted to usage.cfg so restarts don't lose today's history.</summary>
     internal sealed class QuotaTracker
     {
         private static readonly string FilePath =
@@ -641,8 +832,13 @@ namespace netMonitor
 
         private sealed class NetworkUsage
         {
+            public string Name;
             public long Rx;
             public long Tx;
+            public DateTime FirstSeen;
+            public DateTime LastSeen;
+            public double ActiveSeconds;
+            public bool Active;
         }
 
         private readonly Dictionary<string, NetworkUsage> _today =
@@ -655,31 +851,86 @@ namespace netMonitor
             get { return _dirty; }
         }
 
-        public void Add(string key, long rx, long tx)
+        /// <summary>Records usage/duration for the active network; also creates the entry
+        /// as soon as a network is used, even with zero traffic.</summary>
+        public void Touch(string key, string name, long rx, long tx, double activeSeconds)
         {
-            if (rx <= 0 && tx <= 0) return;
             CheckDay();
+            bool isNew = !_today.ContainsKey(key);
             NetworkUsage u;
-            if (!_today.TryGetValue(key, out u))
+            if (isNew)
             {
                 u = new NetworkUsage();
+                u.FirstSeen = DateTime.Now;
                 _today[key] = u;
             }
-            u.Rx += rx;
-            u.Tx += tx;
+            else
+            {
+                u = _today[key];
+            }
+            if (u.Name == null || u.Name.Length == 0) u.Name = name;
+            if (rx > 0 || tx > 0)
+            {
+                u.Rx += rx;
+                u.Tx += tx;
+                _dirty = true;
+            }
+            DateTime now = DateTime.Now;
+            u.LastSeen = now;
+            if (activeSeconds > 0 && activeSeconds < 5)
+            {
+                u.ActiveSeconds += activeSeconds;
+            }
             _dirty = true;
         }
 
-        public string Total(string key)
+        /// <summary>Marks exactly one network as currently active (or none).</summary>
+        public void SetActive(string key)
+        {
+            bool changed = false;
+            foreach (KeyValuePair<string, NetworkUsage> kv in _today)
+            {
+                bool active = key != null && kv.Key == key;
+                if (kv.Value.Active != active)
+                {
+                    kv.Value.Active = active;
+                    changed = true;
+                }
+            }
+            if (changed) _dirty = true;
+        }
+
+        public QuotaView TodayHistory()
         {
             CheckDay();
-            NetworkUsage u;
+            QuotaView view = new QuotaView();
             long total = 0;
-            if (_today.TryGetValue(key, out u)) total = u.Rx + u.Tx;
-            if (total >= 1073741824.0) return (total / 1073741824.0).ToString("F2") + " GB";
-            if (total >= 1048576.0) return (total / 1048576.0).ToString("F1") + " MB";
-            if (total >= 1024.0) return (total / 1024.0).ToString("F1") + " KB";
-            return total + " B";
+            foreach (KeyValuePair<string, NetworkUsage> kv in _today)
+            {
+                NetworkUsage u = kv.Value;
+                QuotaRow row = new QuotaRow();
+                row.Key = kv.Key;
+                row.Name = u.Name ?? ("Jaringan " + kv.Key);
+                row.Rx = u.Rx;
+                row.Tx = u.Tx;
+                row.FirstSeen = u.FirstSeen;
+                row.LastSeen = u.LastSeen;
+                row.ActiveSeconds = u.ActiveSeconds;
+                row.Active = u.Active;
+                view.Rows.Add(row);
+                total += u.Rx + u.Tx;
+            }
+            view.Rows.Sort(delegate(QuotaRow a, QuotaRow b) { return a.FirstSeen.CompareTo(b.FirstSeen); });
+            view.TotalText = FormatBytes(total);
+            return view;
+        }
+
+        public static string FormatBytes(long bytes)
+        {
+            if (bytes >= 1073741824L) return (bytes / 1073741824.0).ToString("F2") + " GB";
+            if (bytes >= 1048576L) return (bytes / 1048576.0).ToString("F1") + " MB";
+            if (bytes >= 1024L) return (bytes / 1024.0).ToString("F1") + " KB";
+            return bytes + " B";
         }
 
         public void Save()
@@ -690,10 +941,16 @@ namespace netMonitor
                 StringBuilder sb = new StringBuilder();
                 foreach (KeyValuePair<string, NetworkUsage> kv in _today)
                 {
+                    NetworkUsage u = kv.Value;
+                    string name = (u.Name ?? "").Replace('|', ' ');
                     sb.Append(_day.ToString("yyyyMMdd"))
                       .Append('|').Append(kv.Key)
-                      .Append('|').Append(kv.Value.Rx)
-                      .Append('|').Append(kv.Value.Tx)
+                      .Append('|').Append(u.Rx)
+                      .Append('|').Append(u.Tx)
+                      .Append('|').Append(name)
+                      .Append('|').Append(u.FirstSeen.Ticks)
+                      .Append('|').Append(u.LastSeen.Ticks)
+                      .Append('|').Append((long)u.ActiveSeconds)
                       .Append(Environment.NewLine);
                 }
                 File.WriteAllText(FilePath, sb.ToString());
@@ -711,12 +968,20 @@ namespace netMonitor
                 foreach (string line in File.ReadAllLines(FilePath))
                 {
                     string[] p = line.Split('|');
-                    if (p.Length != 4 || p[0] != today) continue;
+                    if (p.Length < 8 || p[0] != today) continue; // skip legacy 4-field lines
                     long rx, tx;
                     if (!long.TryParse(p[2], out rx) || !long.TryParse(p[3], out tx)) continue;
                     NetworkUsage u = new NetworkUsage();
                     u.Rx = rx;
                     u.Tx = tx;
+                    u.Name = p[4];
+                    long t;
+                    if (long.TryParse(p[5], out t)) u.FirstSeen = new DateTime(t);
+                    if (long.TryParse(p[6], out t)) u.LastSeen = new DateTime(t);
+                    long a;
+                    if (long.TryParse(p[7], out a)) u.ActiveSeconds = a;
+                    if (u.FirstSeen == DateTime.MinValue) u.FirstSeen = DateTime.Now;
+                    if (u.LastSeen == DateTime.MinValue) u.LastSeen = u.FirstSeen;
                     _today[p[1]] = u;
                 }
             }
@@ -727,7 +992,7 @@ namespace netMonitor
         {
             if (DateTime.Today == _day) return;
             _day = DateTime.Today;
-            _today.Clear();  // daily reset: usage starts from 0 again
+            _today.Clear();  // daily reset: everything starts from 0 again
             _dirty = true;
         }
     }

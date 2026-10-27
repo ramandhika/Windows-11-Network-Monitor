@@ -1,6 +1,10 @@
 # User runtime data
 usage.cfg
 overlay.cfg
+events.log
 
-# Build artifacts (exe is committed intentionally for direct download)
+# Screenshots used during development
+shot*.png
+
+# Build artifacts
 *.pdb
